@@ -99,6 +99,7 @@ static int g_default_max_ping_strikes = DEFAULT_MAX_PING_STRIKES;
 
 #define MAX_CLIENT_STREAM_ID 0x7fffffffu
 grpc_core::TraceFlag grpc_http_trace(false, "http");
+grpc_core::TraceFlag grpc_keepalive_trace(false, "http_keepalive");
 grpc_core::DebugOnlyTraceFlag grpc_trace_chttp2_refcount(false,
                                                          "chttp2_refcount");
 
@@ -1355,10 +1356,8 @@ static void perform_stream_op_locked(void* stream_op,
   s->context = op->payload->context;
   s->traced = op->is_traced;
   if (GRPC_TRACE_FLAG_ENABLED(grpc_http_trace)) {
-    char* str = grpc_transport_stream_op_batch_string(op);
-    gpr_log(GPR_INFO, "perform_stream_op_locked: %s; on_complete = %p", str,
-            op->on_complete);
-    gpr_free(str);
+    gpr_log(GPR_INFO, "perform_stream_op_locked: %s; on_complete = %p",
+            grpc_transport_stream_op_batch_string(op).c_str(), op->on_complete);
     if (op->send_initial_metadata) {
       log_metadata(op_payload->send_initial_metadata.send_initial_metadata,
                    s->id, t->is_client, true);
@@ -1653,9 +1652,8 @@ static void perform_stream_op(grpc_transport* gt, grpc_stream* gs,
   }
 
   if (GRPC_TRACE_FLAG_ENABLED(grpc_http_trace)) {
-    char* str = grpc_transport_stream_op_batch_string(op);
-    gpr_log(GPR_INFO, "perform_stream_op[s=%p]: %s", s, str);
-    gpr_free(str);
+    gpr_log(GPR_INFO, "perform_stream_op[s=%p]: %s", s,
+            grpc_transport_stream_op_batch_string(op).c_str());
   }
 
   GRPC_CHTTP2_STREAM_REF(s, "perform_stream_op");
@@ -1844,9 +1842,8 @@ static void perform_transport_op_locked(void* stream_op,
 static void perform_transport_op(grpc_transport* gt, grpc_transport_op* op) {
   grpc_chttp2_transport* t = reinterpret_cast<grpc_chttp2_transport*>(gt);
   if (GRPC_TRACE_FLAG_ENABLED(grpc_http_trace)) {
-    char* msg = grpc_transport_op_string(op);
-    gpr_log(GPR_INFO, "perform_transport_op[t=%p]: %s", t, msg);
-    gpr_free(msg);
+    gpr_log(GPR_INFO, "perform_transport_op[t=%p]: %s", t,
+            grpc_transport_op_string(op).c_str());
   }
   op->handler_private.extra_arg = gt;
   GRPC_CHTTP2_REF_TRANSPORT(t, "transport_op");
@@ -2484,7 +2481,8 @@ static grpc_error* try_http_parsing(grpc_chttp2_transport* t) {
         grpc_error_set_int(GRPC_ERROR_CREATE_FROM_STATIC_STRING(
                                "Trying to connect an http1.x server"),
                            GRPC_ERROR_INT_HTTP_STATUS, response.status),
-        GRPC_ERROR_INT_GRPC_STATUS, GRPC_STATUS_UNAVAILABLE);
+        GRPC_ERROR_INT_GRPC_STATUS,
+        grpc_http2_status_to_grpc_status(response.status));
   }
   GRPC_ERROR_UNREF(parse_error);
 
@@ -2817,7 +2815,8 @@ static void start_keepalive_ping_locked(void* arg, grpc_error* error) {
   if (t->channelz_socket != nullptr) {
     t->channelz_socket->RecordKeepaliveSent();
   }
-  if (GRPC_TRACE_FLAG_ENABLED(grpc_http_trace)) {
+  if (GRPC_TRACE_FLAG_ENABLED(grpc_http_trace) ||
+      GRPC_TRACE_FLAG_ENABLED(grpc_keepalive_trace)) {
     gpr_log(GPR_INFO, "%s: Start keepalive ping", t->peer_string);
   }
   GRPC_CHTTP2_REF_TRANSPORT(t, "keepalive watchdog");
@@ -2840,7 +2839,8 @@ static void finish_keepalive_ping_locked(void* arg, grpc_error* error) {
   grpc_chttp2_transport* t = static_cast<grpc_chttp2_transport*>(arg);
   if (t->keepalive_state == GRPC_CHTTP2_KEEPALIVE_STATE_PINGING) {
     if (error == GRPC_ERROR_NONE) {
-      if (GRPC_TRACE_FLAG_ENABLED(grpc_http_trace)) {
+      if (GRPC_TRACE_FLAG_ENABLED(grpc_http_trace) ||
+          GRPC_TRACE_FLAG_ENABLED(grpc_keepalive_trace)) {
         gpr_log(GPR_INFO, "%s: Finish keepalive ping", t->peer_string);
       }
       if (!t->keepalive_ping_started) {

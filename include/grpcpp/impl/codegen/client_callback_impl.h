@@ -267,12 +267,19 @@ class ClientBidiReactor {
   /// StartWritesDone that indicates that there will be no more write ops.
   /// The number of RemoveHold calls must match the total number of AddHold
   /// calls plus the number of holds added by AddMultipleHolds.
+  /// The argument to AddMultipleHolds must be positive.
   void AddHold() { AddMultipleHolds(1); }
-  void AddMultipleHolds(int holds) { stream_->AddHold(holds); }
+  void AddMultipleHolds(int holds) {
+    GPR_CODEGEN_DEBUG_ASSERT(holds > 0);
+    stream_->AddHold(holds);
+  }
   void RemoveHold() { stream_->RemoveHold(); }
 
   /// Notifies the application that all operations associated with this RPC
-  /// have completed and provides the RPC status outcome.
+  /// have completed and all Holds have been removed. OnDone provides the RPC
+  /// status outcome for both successful and failed RPCs and will be called in
+  /// all cases. If it is not called, it indicates an application-level problem
+  /// (like failure to remove a hold).
   ///
   /// \param[in] s The status outcome of this RPC
   virtual void OnDone(const ::grpc::Status& /*s*/) {}
@@ -283,19 +290,21 @@ class ClientBidiReactor {
   /// call of OnReadDone or OnDone.
   ///
   /// \param[in] ok Was the initial metadata read successfully? If false, no
-  ///               new read/write operation will succeed.
+  ///               new read/write operation will succeed, and any further
+  ///               Start* operations should not be called.
   virtual void OnReadInitialMetadataDone(bool /*ok*/) {}
 
   /// Notifies the application that a StartRead operation completed.
   ///
   /// \param[in] ok Was it successful? If false, no new read/write operation
-  ///               will succeed.
+  ///               will succeed, and any further Start* should not be called.
   virtual void OnReadDone(bool /*ok*/) {}
 
-  /// Notifies the application that a StartWrite operation completed.
+  /// Notifies the application that a StartWrite or StartWriteLast operation
+  /// completed.
   ///
   /// \param[in] ok Was it successful? If false, no new read/write operation
-  ///               will succeed.
+  ///               will succeed, and any further Start* should not be called.
   virtual void OnWriteDone(bool /*ok*/) {}
 
   /// Notifies the application that a StartWritesDone operation completed. Note
@@ -303,7 +312,8 @@ class ClientBidiReactor {
   /// those that are implicitly invoked as part of a StartWriteLast.
   ///
   /// \param[in] ok Was it successful? If false, the application will later see
-  ///               the failure reflected as a bad status in OnDone.
+  ///               the failure reflected as a bad status in OnDone and no
+  ///               further Start* should be called.
   virtual void OnWritesDoneDone(bool /*ok*/) {}
 
  private:
@@ -325,7 +335,10 @@ class ClientReadReactor {
   void StartRead(Response* resp) { reader_->Read(resp); }
 
   void AddHold() { AddMultipleHolds(1); }
-  void AddMultipleHolds(int holds) { reader_->AddHold(holds); }
+  void AddMultipleHolds(int holds) {
+    GPR_CODEGEN_DEBUG_ASSERT(holds > 0);
+    reader_->AddHold(holds);
+  }
   void RemoveHold() { reader_->RemoveHold(); }
 
   virtual void OnDone(const ::grpc::Status& /*s*/) {}
@@ -358,7 +371,10 @@ class ClientWriteReactor {
   void StartWritesDone() { writer_->WritesDone(); }
 
   void AddHold() { AddMultipleHolds(1); }
-  void AddMultipleHolds(int holds) { writer_->AddHold(holds); }
+  void AddMultipleHolds(int holds) {
+    GPR_CODEGEN_DEBUG_ASSERT(holds > 0);
+    writer_->AddHold(holds);
+  }
   void RemoveHold() { writer_->RemoveHold(); }
 
   virtual void OnDone(const ::grpc::Status& /*s*/) {}
@@ -445,76 +461,51 @@ class ClientCallbackReaderWriterImpl
     // 1. Send initial metadata (unless corked) + recv initial metadata
     // 2. Any read backlog
     // 3. Any write backlog
-    // 4. Recv trailing metadata, on_completion callback
-    started_ = true;
-
-    start_tag_.Set(call_.call(),
-                   [this](bool ok) {
-                     reactor_->OnReadInitialMetadataDone(ok);
-                     MaybeFinish();
-                   },
-                   &start_ops_, /*can_inline=*/false);
+    // 4. Recv trailing metadata (unless corked)
     if (!start_corked_) {
       start_ops_.SendInitialMetadata(&context_->send_initial_metadata_,
                                      context_->initial_metadata_flags());
     }
-    start_ops_.RecvInitialMetadata(context_);
-    start_ops_.set_core_cq_tag(&start_tag_);
+
     call_.PerformOps(&start_ops_);
 
-    // Also set up the read and write tags so that they don't have to be set up
-    // each time
-    write_tag_.Set(call_.call(),
-                   [this](bool ok) {
-                     reactor_->OnWriteDone(ok);
-                     MaybeFinish();
-                   },
-                   &write_ops_, /*can_inline=*/false);
-    write_ops_.set_core_cq_tag(&write_tag_);
+    {
+      grpc::internal::MutexLock lock(&start_mu_);
 
-    read_tag_.Set(call_.call(),
-                  [this](bool ok) {
-                    reactor_->OnReadDone(ok);
-                    MaybeFinish();
-                  },
-                  &read_ops_, /*can_inline=*/false);
-    read_ops_.set_core_cq_tag(&read_tag_);
-    if (read_ops_at_start_) {
-      call_.PerformOps(&read_ops_);
+      if (backlog_.read_ops) {
+        call_.PerformOps(&read_ops_);
+      }
+      if (backlog_.write_ops) {
+        call_.PerformOps(&write_ops_);
+      }
+      if (backlog_.writes_done_ops) {
+        call_.PerformOps(&writes_done_ops_);
+      }
+      call_.PerformOps(&finish_ops_);
+      // The last thing in this critical section is to set started_ so that it
+      // can be used lock-free as well.
+      started_.store(true, std::memory_order_release);
     }
-
-    if (write_ops_at_start_) {
-      call_.PerformOps(&write_ops_);
-    }
-
-    if (writes_done_ops_at_start_) {
-      call_.PerformOps(&writes_done_ops_);
-    }
-
-    finish_tag_.Set(call_.call(), [this](bool /*ok*/) { MaybeFinish(); },
-                    &finish_ops_, /*can_inline=*/false);
-    finish_ops_.ClientRecvStatus(context_, &finish_status_);
-    finish_ops_.set_core_cq_tag(&finish_tag_);
-    call_.PerformOps(&finish_ops_);
+    // MaybeFinish outside the lock to make sure that destruction of this object
+    // doesn't take place while holding the lock (which would cause the lock to
+    // be released after destruction)
+    this->MaybeFinish();
   }
 
   void Read(Response* msg) override {
     read_ops_.RecvMessage(msg);
     callbacks_outstanding_.fetch_add(1, std::memory_order_relaxed);
-    if (started_) {
-      call_.PerformOps(&read_ops_);
-    } else {
-      read_ops_at_start_ = true;
+    if (GPR_UNLIKELY(!started_.load(std::memory_order_acquire))) {
+      grpc::internal::MutexLock lock(&start_mu_);
+      if (GPR_LIKELY(!started_.load(std::memory_order_relaxed))) {
+        backlog_.read_ops = true;
+        return;
+      }
     }
+    call_.PerformOps(&read_ops_);
   }
 
   void Write(const Request* msg, ::grpc::WriteOptions options) override {
-    if (start_corked_) {
-      write_ops_.SendInitialMetadata(&context_->send_initial_metadata_,
-                                     context_->initial_metadata_flags());
-      start_corked_ = false;
-    }
-
     if (options.is_last_message()) {
       options.set_buffer_hint();
       write_ops_.ClientSendClose();
@@ -522,18 +513,22 @@ class ClientCallbackReaderWriterImpl
     // TODO(vjpai): don't assert
     GPR_CODEGEN_ASSERT(write_ops_.SendMessagePtr(msg, options).ok());
     callbacks_outstanding_.fetch_add(1, std::memory_order_relaxed);
-    if (started_) {
-      call_.PerformOps(&write_ops_);
-    } else {
-      write_ops_at_start_ = true;
+    if (GPR_UNLIKELY(corked_write_needed_)) {
+      write_ops_.SendInitialMetadata(&context_->send_initial_metadata_,
+                                     context_->initial_metadata_flags());
+      corked_write_needed_ = false;
     }
+
+    if (GPR_UNLIKELY(!started_.load(std::memory_order_acquire))) {
+      grpc::internal::MutexLock lock(&start_mu_);
+      if (GPR_LIKELY(!started_.load(std::memory_order_relaxed))) {
+        backlog_.write_ops = true;
+        return;
+      }
+    }
+    call_.PerformOps(&write_ops_);
   }
   void WritesDone() override {
-    if (start_corked_) {
-      writes_done_ops_.SendInitialMetadata(&context_->send_initial_metadata_,
-                                           context_->initial_metadata_flags());
-      start_corked_ = false;
-    }
     writes_done_ops_.ClientSendClose();
     writes_done_tag_.Set(call_.call(),
                          [this](bool ok) {
@@ -543,11 +538,19 @@ class ClientCallbackReaderWriterImpl
                          &writes_done_ops_, /*can_inline=*/false);
     writes_done_ops_.set_core_cq_tag(&writes_done_tag_);
     callbacks_outstanding_.fetch_add(1, std::memory_order_relaxed);
-    if (started_) {
-      call_.PerformOps(&writes_done_ops_);
-    } else {
-      writes_done_ops_at_start_ = true;
+    if (GPR_UNLIKELY(corked_write_needed_)) {
+      writes_done_ops_.SendInitialMetadata(&context_->send_initial_metadata_,
+                                           context_->initial_metadata_flags());
+      corked_write_needed_ = false;
     }
+    if (GPR_UNLIKELY(!started_.load(std::memory_order_acquire))) {
+      grpc::internal::MutexLock lock(&start_mu_);
+      if (GPR_LIKELY(!started_.load(std::memory_order_relaxed))) {
+        backlog_.writes_done_ops = true;
+        return;
+      }
+    }
+    call_.PerformOps(&writes_done_ops_);
   }
 
   void AddHold(int holds) override {
@@ -564,8 +567,42 @@ class ClientCallbackReaderWriterImpl
       : context_(context),
         call_(call),
         reactor_(reactor),
-        start_corked_(context_->initial_metadata_corked_) {
+        start_corked_(context_->initial_metadata_corked_),
+        corked_write_needed_(start_corked_) {
     this->BindReactor(reactor);
+
+    // Set up the unchanging parts of the start, read, and write tags and ops.
+    start_tag_.Set(call_.call(),
+                   [this](bool ok) {
+                     reactor_->OnReadInitialMetadataDone(ok);
+                     MaybeFinish();
+                   },
+                   &start_ops_, /*can_inline=*/false);
+    start_ops_.RecvInitialMetadata(context_);
+    start_ops_.set_core_cq_tag(&start_tag_);
+
+    write_tag_.Set(call_.call(),
+                   [this](bool ok) {
+                     reactor_->OnWriteDone(ok);
+                     MaybeFinish();
+                   },
+                   &write_ops_, /*can_inline=*/false);
+    write_ops_.set_core_cq_tag(&write_tag_);
+
+    read_tag_.Set(call_.call(),
+                  [this](bool ok) {
+                    reactor_->OnReadDone(ok);
+                    MaybeFinish();
+                  },
+                  &read_ops_, /*can_inline=*/false);
+    read_ops_.set_core_cq_tag(&read_tag_);
+
+    // Also set up the Finish tag and op set.
+    finish_tag_.Set(call_.call(), [this](bool /*ok*/) { MaybeFinish(); },
+                    &finish_ops_,
+                    /*can_inline=*/false);
+    finish_ops_.ClientRecvStatus(context_, &finish_status_);
+    finish_ops_.set_core_cq_tag(&finish_tag_);
   }
 
   ::grpc_impl::ClientContext* const context_;
@@ -576,7 +613,9 @@ class ClientCallbackReaderWriterImpl
                             grpc::internal::CallOpRecvInitialMetadata>
       start_ops_;
   grpc::internal::CallbackWithSuccessTag start_tag_;
-  bool start_corked_;
+  const bool start_corked_;
+  bool corked_write_needed_;  // no lock needed since only accessed in
+                              // Write/WritesDone which cannot be concurrent
 
   grpc::internal::CallOpSet<grpc::internal::CallOpClientRecvStatus> finish_ops_;
   grpc::internal::CallbackWithSuccessTag finish_tag_;
@@ -587,22 +626,27 @@ class ClientCallbackReaderWriterImpl
                             grpc::internal::CallOpClientSendClose>
       write_ops_;
   grpc::internal::CallbackWithSuccessTag write_tag_;
-  bool write_ops_at_start_{false};
 
   grpc::internal::CallOpSet<grpc::internal::CallOpSendInitialMetadata,
                             grpc::internal::CallOpClientSendClose>
       writes_done_ops_;
   grpc::internal::CallbackWithSuccessTag writes_done_tag_;
-  bool writes_done_ops_at_start_{false};
 
   grpc::internal::CallOpSet<grpc::internal::CallOpRecvMessage<Response>>
       read_ops_;
   grpc::internal::CallbackWithSuccessTag read_tag_;
-  bool read_ops_at_start_{false};
 
-  // Minimum of 2 callbacks to pre-register for start and finish
-  std::atomic<intptr_t> callbacks_outstanding_{2};
-  bool started_{false};
+  struct StartCallBacklog {
+    bool write_ops = false;
+    bool writes_done_ops = false;
+    bool read_ops = false;
+  };
+  StartCallBacklog backlog_ /* GUARDED_BY(start_mu_) */;
+
+  // Minimum of 3 callbacks to pre-register for start ops, StartCall, and finish
+  std::atomic<intptr_t> callbacks_outstanding_{3};
+  std::atomic_bool started_{false};
+  grpc::internal::Mutex start_mu_;
 };
 
 template <class Request, class Response>
@@ -654,8 +698,7 @@ class ClientCallbackReaderImpl : public ClientCallbackReader<Response> {
     // This call initiates two batches, plus any backlog, each with a callback
     // 1. Send initial metadata (unless corked) + recv initial metadata
     // 2. Any backlog
-    // 3. Recv trailing metadata, on_completion callback
-    started_ = true;
+    // 3. Recv trailing metadata
 
     start_tag_.Set(call_.call(),
                    [this](bool ok) {
@@ -677,8 +720,13 @@ class ClientCallbackReaderImpl : public ClientCallbackReader<Response> {
                   },
                   &read_ops_, /*can_inline=*/false);
     read_ops_.set_core_cq_tag(&read_tag_);
-    if (read_ops_at_start_) {
-      call_.PerformOps(&read_ops_);
+
+    {
+      grpc::internal::MutexLock lock(&start_mu_);
+      if (backlog_.read_ops) {
+        call_.PerformOps(&read_ops_);
+      }
+      started_.store(true, std::memory_order_release);
     }
 
     finish_tag_.Set(call_.call(), [this](bool /*ok*/) { MaybeFinish(); },
@@ -691,11 +739,14 @@ class ClientCallbackReaderImpl : public ClientCallbackReader<Response> {
   void Read(Response* msg) override {
     read_ops_.RecvMessage(msg);
     callbacks_outstanding_.fetch_add(1, std::memory_order_relaxed);
-    if (started_) {
-      call_.PerformOps(&read_ops_);
-    } else {
-      read_ops_at_start_ = true;
+    if (GPR_UNLIKELY(!started_.load(std::memory_order_acquire))) {
+      grpc::internal::MutexLock lock(&start_mu_);
+      if (GPR_LIKELY(!started_.load(std::memory_order_relaxed))) {
+        backlog_.read_ops = true;
+        return;
+      }
     }
+    call_.PerformOps(&read_ops_);
   }
 
   void AddHold(int holds) override {
@@ -736,11 +787,16 @@ class ClientCallbackReaderImpl : public ClientCallbackReader<Response> {
   grpc::internal::CallOpSet<grpc::internal::CallOpRecvMessage<Response>>
       read_ops_;
   grpc::internal::CallbackWithSuccessTag read_tag_;
-  bool read_ops_at_start_{false};
+
+  struct StartCallBacklog {
+    bool read_ops = false;
+  };
+  StartCallBacklog backlog_ /* GUARDED_BY(start_mu_) */;
 
   // Minimum of 2 callbacks to pre-register for start and finish
   std::atomic<intptr_t> callbacks_outstanding_{2};
-  bool started_{false};
+  std::atomic_bool started_{false};
+  grpc::internal::Mutex start_mu_;
 };
 
 template <class Response>
@@ -793,74 +849,60 @@ class ClientCallbackWriterImpl : public ClientCallbackWriter<Request> {
     // This call initiates two batches, plus any backlog, each with a callback
     // 1. Send initial metadata (unless corked) + recv initial metadata
     // 2. Any backlog
-    // 3. Recv trailing metadata, on_completion callback
-    started_ = true;
+    // 3. Recv trailing metadata
 
-    start_tag_.Set(call_.call(),
-                   [this](bool ok) {
-                     reactor_->OnReadInitialMetadataDone(ok);
-                     MaybeFinish();
-                   },
-                   &start_ops_, /*can_inline=*/false);
     if (!start_corked_) {
       start_ops_.SendInitialMetadata(&context_->send_initial_metadata_,
                                      context_->initial_metadata_flags());
     }
-    start_ops_.RecvInitialMetadata(context_);
-    start_ops_.set_core_cq_tag(&start_tag_);
     call_.PerformOps(&start_ops_);
 
-    // Also set up the read and write tags so that they don't have to be set up
-    // each time
-    write_tag_.Set(call_.call(),
-                   [this](bool ok) {
-                     reactor_->OnWriteDone(ok);
-                     MaybeFinish();
-                   },
-                   &write_ops_, /*can_inline=*/false);
-    write_ops_.set_core_cq_tag(&write_tag_);
+    {
+      grpc::internal::MutexLock lock(&start_mu_);
 
-    if (write_ops_at_start_) {
-      call_.PerformOps(&write_ops_);
+      if (backlog_.write_ops) {
+        call_.PerformOps(&write_ops_);
+      }
+      if (backlog_.writes_done_ops) {
+        call_.PerformOps(&writes_done_ops_);
+      }
+      call_.PerformOps(&finish_ops_);
+      // The last thing in this critical section is to set started_ so that it
+      // can be used lock-free as well.
+      started_.store(true, std::memory_order_release);
     }
-
-    if (writes_done_ops_at_start_) {
-      call_.PerformOps(&writes_done_ops_);
-    }
-
-    finish_tag_.Set(call_.call(), [this](bool /*ok*/) { MaybeFinish(); },
-                    &finish_ops_, /*can_inline=*/false);
-    finish_ops_.ClientRecvStatus(context_, &finish_status_);
-    finish_ops_.set_core_cq_tag(&finish_tag_);
-    call_.PerformOps(&finish_ops_);
+    // MaybeFinish outside the lock to make sure that destruction of this object
+    // doesn't take place while holding the lock (which would cause the lock to
+    // be released after destruction)
+    this->MaybeFinish();
   }
 
   void Write(const Request* msg, ::grpc::WriteOptions options) override {
-    if (start_corked_) {
-      write_ops_.SendInitialMetadata(&context_->send_initial_metadata_,
-                                     context_->initial_metadata_flags());
-      start_corked_ = false;
-    }
-
-    if (options.is_last_message()) {
+    if (GPR_UNLIKELY(options.is_last_message())) {
       options.set_buffer_hint();
       write_ops_.ClientSendClose();
     }
     // TODO(vjpai): don't assert
     GPR_CODEGEN_ASSERT(write_ops_.SendMessagePtr(msg, options).ok());
     callbacks_outstanding_.fetch_add(1, std::memory_order_relaxed);
-    if (started_) {
-      call_.PerformOps(&write_ops_);
-    } else {
-      write_ops_at_start_ = true;
+
+    if (GPR_UNLIKELY(corked_write_needed_)) {
+      write_ops_.SendInitialMetadata(&context_->send_initial_metadata_,
+                                     context_->initial_metadata_flags());
+      corked_write_needed_ = false;
     }
+
+    if (GPR_UNLIKELY(!started_.load(std::memory_order_acquire))) {
+      grpc::internal::MutexLock lock(&start_mu_);
+      if (GPR_LIKELY(!started_.load(std::memory_order_relaxed))) {
+        backlog_.write_ops = true;
+        return;
+      }
+    }
+    call_.PerformOps(&write_ops_);
   }
+
   void WritesDone() override {
-    if (start_corked_) {
-      writes_done_ops_.SendInitialMetadata(&context_->send_initial_metadata_,
-                                           context_->initial_metadata_flags());
-      start_corked_ = false;
-    }
     writes_done_ops_.ClientSendClose();
     writes_done_tag_.Set(call_.call(),
                          [this](bool ok) {
@@ -870,11 +912,21 @@ class ClientCallbackWriterImpl : public ClientCallbackWriter<Request> {
                          &writes_done_ops_, /*can_inline=*/false);
     writes_done_ops_.set_core_cq_tag(&writes_done_tag_);
     callbacks_outstanding_.fetch_add(1, std::memory_order_relaxed);
-    if (started_) {
-      call_.PerformOps(&writes_done_ops_);
-    } else {
-      writes_done_ops_at_start_ = true;
+
+    if (GPR_UNLIKELY(corked_write_needed_)) {
+      writes_done_ops_.SendInitialMetadata(&context_->send_initial_metadata_,
+                                           context_->initial_metadata_flags());
+      corked_write_needed_ = false;
     }
+
+    if (GPR_UNLIKELY(!started_.load(std::memory_order_acquire))) {
+      grpc::internal::MutexLock lock(&start_mu_);
+      if (GPR_LIKELY(!started_.load(std::memory_order_relaxed))) {
+        backlog_.writes_done_ops = true;
+        return;
+      }
+    }
+    call_.PerformOps(&writes_done_ops_);
   }
 
   void AddHold(int holds) override {
@@ -893,10 +945,36 @@ class ClientCallbackWriterImpl : public ClientCallbackWriter<Request> {
       : context_(context),
         call_(call),
         reactor_(reactor),
-        start_corked_(context_->initial_metadata_corked_) {
+        start_corked_(context_->initial_metadata_corked_),
+        corked_write_needed_(start_corked_) {
     this->BindReactor(reactor);
+
+    // Set up the unchanging parts of the start and write tags and ops.
+    start_tag_.Set(call_.call(),
+                   [this](bool ok) {
+                     reactor_->OnReadInitialMetadataDone(ok);
+                     MaybeFinish();
+                   },
+                   &start_ops_, /*can_inline=*/false);
+    start_ops_.RecvInitialMetadata(context_);
+    start_ops_.set_core_cq_tag(&start_tag_);
+
+    write_tag_.Set(call_.call(),
+                   [this](bool ok) {
+                     reactor_->OnWriteDone(ok);
+                     MaybeFinish();
+                   },
+                   &write_ops_, /*can_inline=*/false);
+    write_ops_.set_core_cq_tag(&write_tag_);
+
+    // Also set up the Finish tag and op set.
     finish_ops_.RecvMessage(response);
     finish_ops_.AllowNoMessage();
+    finish_tag_.Set(call_.call(), [this](bool /*ok*/) { MaybeFinish(); },
+                    &finish_ops_,
+                    /*can_inline=*/false);
+    finish_ops_.ClientRecvStatus(context_, &finish_status_);
+    finish_ops_.set_core_cq_tag(&finish_tag_);
   }
 
   ::grpc_impl::ClientContext* const context_;
@@ -907,7 +985,9 @@ class ClientCallbackWriterImpl : public ClientCallbackWriter<Request> {
                             grpc::internal::CallOpRecvInitialMetadata>
       start_ops_;
   grpc::internal::CallbackWithSuccessTag start_tag_;
-  bool start_corked_;
+  const bool start_corked_;
+  bool corked_write_needed_;  // no lock needed since only accessed in
+                              // Write/WritesDone which cannot be concurrent
 
   grpc::internal::CallOpSet<grpc::internal::CallOpGenericRecvMessage,
                             grpc::internal::CallOpClientRecvStatus>
@@ -920,17 +1000,22 @@ class ClientCallbackWriterImpl : public ClientCallbackWriter<Request> {
                             grpc::internal::CallOpClientSendClose>
       write_ops_;
   grpc::internal::CallbackWithSuccessTag write_tag_;
-  bool write_ops_at_start_{false};
 
   grpc::internal::CallOpSet<grpc::internal::CallOpSendInitialMetadata,
                             grpc::internal::CallOpClientSendClose>
       writes_done_ops_;
   grpc::internal::CallbackWithSuccessTag writes_done_tag_;
-  bool writes_done_ops_at_start_{false};
 
-  // Minimum of 2 callbacks to pre-register for start and finish
-  std::atomic<intptr_t> callbacks_outstanding_{2};
-  bool started_{false};
+  struct StartCallBacklog {
+    bool write_ops = false;
+    bool writes_done_ops = false;
+  };
+  StartCallBacklog backlog_ /* GUARDED_BY(start_mu_) */;
+
+  // Minimum of 3 callbacks to pre-register for start ops, StartCall, and finish
+  std::atomic<intptr_t> callbacks_outstanding_{3};
+  std::atomic_bool started_{false};
+  grpc::internal::Mutex start_mu_;
 };
 
 template <class Request>
@@ -969,7 +1054,6 @@ class ClientCallbackUnaryImpl final : public ClientCallbackUnary {
     // This call initiates two batches, each with a callback
     // 1. Send initial metadata + write + writes done + recv initial metadata
     // 2. Read message, recv trailing metadata
-    started_ = true;
 
     start_tag_.Set(call_.call(),
                    [this](bool ok) {
@@ -1037,7 +1121,6 @@ class ClientCallbackUnaryImpl final : public ClientCallbackUnary {
 
   // This call will have 2 callbacks: start and finish
   std::atomic<intptr_t> callbacks_outstanding_{2};
-  bool started_{false};
 };
 
 class ClientCallbackUnaryFactory {
